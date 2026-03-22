@@ -1,6 +1,8 @@
 from extension import probe
 from extension.probe import (
     JSONValue,
+    LimitMetric,
+    gemini_compact_label,
     parse_claude_usage_screen,
     parse_gemini_quota_metrics,
     safe_percent_remaining,
@@ -58,6 +60,19 @@ def test_parse_gemini_quota_metrics_extracts_model_rows() -> None:
     assert metrics["gemini_2_5_flash"].percent_remaining == 88.0
     assert metrics["gemini_2_5_pro"].percent_remaining == 100.0
     assert "gemini_3_pro_preview" not in metrics
+
+
+def test_gemini_compact_label_uses_lowest_two_remaining_values() -> None:
+    metrics = {
+        "gemini_2_5_flash": LimitMetric("gemini-2.5-flash", 89.0, "89% left"),
+        "gemini_2_5_flash_lite": LimitMetric("gemini-2.5-flash-lite", 97.0, "97% left"),
+        "gemini_2_5_pro": LimitMetric("gemini-2.5-pro", 100.0, "100% left"),
+        "gemini_3_flash_preview": LimitMetric(
+            "gemini-3-flash-preview", 92.0, "92% left"
+        ),
+    }
+
+    assert gemini_compact_label(metrics) == "Ge 89/92"
 
 
 def test_parse_claude_usage_screen_keeps_session_and_week_resets_separate() -> None:
