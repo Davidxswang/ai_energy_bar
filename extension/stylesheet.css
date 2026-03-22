@@ -1,0 +1,28 @@
+.ai-energy-label {
+  font-weight: 600;
+  min-width: 10em;
+}
+
+.ai-energy-header {
+  font-weight: 700;
+}
+
+.ai-energy-provider-box {
+  width: 28em;
+  padding-top: 0.05em;
+  padding-bottom: 0.05em;
+}
+
+.ai-energy-provider-title {
+  font-weight: 700;
+}
+
+.ai-energy-provider-summary {
+}
+
+.ai-energy-provider-detail {
+}
+
+.ai-energy-provider-warning {
+  font-weight: 600;
+}
