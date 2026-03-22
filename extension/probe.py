@@ -764,6 +764,19 @@ def parse_gemini_quota_metrics(
     return metrics, tier_text, current_model_text, detail_text
 
 
+def gemini_compact_label(metrics: dict[str, LimitMetric]) -> str:
+    remaining_values = sorted(
+        metric.percent_remaining
+        for metric in metrics.values()
+        if metric.percent_remaining is not None
+    )
+    if len(remaining_values) >= 2:
+        return f"Ge {remaining_values[0]:.0f}/{remaining_values[1]:.0f}"
+    if remaining_values:
+        return f"Ge {remaining_values[0]:.0f}"
+    return "Ge --"
+
+
 def codex_status() -> ProviderStatus:
     version = get_version("codex", ["-V"])
     if version is None:
@@ -924,14 +937,7 @@ def gemini_status() -> ProviderStatus:
             parse_gemini_quota_metrics(live_quota)
         )
         if metrics:
-            flash = metrics.get("gemini_2_5_flash")
-            pro = metrics.get("gemini_2_5_pro")
-            compact = "Ge --"
-            if flash is not None and pro is not None:
-                flash_remaining = flash.percent_remaining
-                pro_remaining = pro.percent_remaining
-                if flash_remaining is not None and pro_remaining is not None:
-                    compact = f"Ge {flash_remaining:.0f}/{pro_remaining:.0f}"
+            compact = gemini_compact_label(metrics)
 
             warning: str | None = None
             low_models = [
