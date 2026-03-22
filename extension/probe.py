@@ -27,11 +27,6 @@ CLAUDE_PERCENT_USED_RE: Final[re.Pattern[str]] = re.compile(
     r"(\d+(?:\.\d+)?)%\s*used",
     re.IGNORECASE,
 )
-CLAUDE_RESET_RE: Final[re.Pattern[str]] = re.compile(
-    r"Re[a-zA-Z]*\s+(.*?)(?=(?:Current session|Current week|Extra usage|"
-    r"Status|Config|Usage|Press Esc|$))",
-    re.IGNORECASE,
-)
 GEMINI_EMAIL_RE: Final[re.Pattern[str]] = re.compile(
     r"Signed in with Google:\s*([^\s/]+@[^\s/]+)"
 )
@@ -390,6 +385,16 @@ def parse_claude_usage_screen(
     screen_text: str,
 ) -> tuple[dict[str, LimitMetric], str | None, str | None, str | None]:
     lines = [line.strip() for line in screen_text.splitlines() if line.strip()]
+    section_headers = {
+        "Current session",
+        "Current week (all models)",
+        "Extra usage",
+        "Status",
+        "Config",
+        "Usage",
+        "Press Esc to exit",
+        "Esc to cancel",
+    }
 
     def normalize_reset_text(raw_reset: str | None) -> str | None:
         if raw_reset is None:
@@ -397,23 +402,47 @@ def parse_claude_usage_screen(
         normalized = re.sub(r"\s+", " ", raw_reset).strip().rstrip(".")
         if not normalized:
             return None
-        if normalized.lower().startswith("resets"):
-            return normalized
-        return f"Resets {normalized}"
+        normalized = re.sub(
+            r"^(?:resets?|reset|reses)\s*",
+            "Resets ",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(r"^Resets\s+in(?=\S)", "Resets in ", normalized)
+        normalized = re.sub(r"^Resets(?=\S)", "Resets ", normalized)
+        return (
+            normalized if normalized.startswith("Resets ") else f"Resets {normalized}"
+        )
+
+    def is_section_header(line: str) -> bool:
+        return line in section_headers
+
+    def looks_like_reset_line(line: str) -> bool:
+        squashed = re.sub(r"\s+", "", line).lower()
+        return squashed.startswith(("resets", "reset", "reses"))
 
     def extract_usage_block(label: str) -> tuple[float | None, str | None]:
         for index, line in enumerate(lines):
             if label not in line:
                 continue
-            block_text = " ".join(lines[index + 1 : index + 8])
+            block_lines: list[str] = []
+            for candidate in lines[index + 1 : index + 8]:
+                if is_section_header(candidate):
+                    break
+                block_lines.append(candidate)
+
+            block_text = " ".join(block_lines)
             percent_used: float | None = None
             reset_text: str | None = None
             used_match = CLAUDE_PERCENT_USED_RE.search(block_text)
             if used_match is not None:
                 percent_used = float(used_match.group(1))
-            reset_match = CLAUDE_RESET_RE.search(block_text)
-            if reset_match is not None:
-                reset_text = normalize_reset_text(reset_match.group(1))
+            for reset_index, candidate in enumerate(block_lines):
+                if not looks_like_reset_line(candidate):
+                    continue
+                reset_fragments = [candidate, *block_lines[reset_index + 1 :]]
+                reset_text = normalize_reset_text(" ".join(reset_fragments))
+                break
             return safe_percent_remaining(percent_used), reset_text
         return None, None
 
