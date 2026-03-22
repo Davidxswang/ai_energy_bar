@@ -1,0 +1,7 @@
+{
+  "uuid": "ai-energy-bar@example.com",
+  "name": "AI Energy Bar",
+  "description": "Top-bar quota and usage widget for Claude Code, Codex, and Gemini CLI.",
+  "shell-version": ["46"],
+  "version": 1
+}
