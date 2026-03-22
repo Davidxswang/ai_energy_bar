@@ -85,6 +85,30 @@ def test_parse_claude_usage_screen_keeps_session_and_week_resets_separate() -> N
     assert extra_usage == "Extra usage not enabled • /extra-usage to enable"
 
 
+def test_parse_claude_usage_screen_handles_mangled_session_reset_line() -> None:
+    screen_text = """
+    Current session
+    ████████████████████████████████████████████████  96%used
+    Reses10pm (America/Los_Angeles)
+    Current week (all models)
+    ██████████                                        20%used
+    Resets Mar 24, 11pm (America/Los_Angeles)
+    Extra usage
+    Extra usage not enabled • /extra-usage to enable
+    Esc to cancel
+    """
+
+    metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
+        screen_text
+    )
+
+    assert metrics["current_session"].percent_remaining == 4.0
+    assert metrics["current_week"].percent_remaining == 80.0
+    assert session_reset == "Resets 10pm (America/Los_Angeles)"
+    assert week_reset == "Resets Mar 24, 11pm (America/Los_Angeles)"
+    assert extra_usage == "Extra usage not enabled • /extra-usage to enable"
+
+
 def test_resolve_command_path_falls_back_to_login_shell(monkeypatch) -> None:
     probe.resolve_command_path.cache_clear()
     monkeypatch.setattr(probe.shutil, "which", lambda command: None)
