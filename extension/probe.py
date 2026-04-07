@@ -329,7 +329,7 @@ def strip_terminal_noise(raw_text: str) -> str:
     return cleaned.strip()
 
 
-def capture_claude_usage_screen(timeout: float = 30.0) -> str | None:
+def capture_claude_usage_screen(timeout: float = 60.0) -> str | None:
     claude_path = resolve_command_path("claude")
     if claude_path is None:
         return None
@@ -354,7 +354,8 @@ def capture_claude_usage_screen(timeout: float = 30.0) -> str | None:
             timeout=timeout,
         )
         child.logfile_read = transcript
-        child.expect([r"❯", r"│ >", r"›", r"> "], timeout=timeout)
+        # Increase initial prompt timeout specifically, as startup can be slow
+        child.expect([r"❯", r"│ >", r"›", r"> "], timeout=max(timeout, 30.0))
         child.send("/status")
         child.expect([r"/status", r"status"], timeout=timeout)
         child.send("\t")
@@ -372,7 +373,13 @@ def capture_claude_usage_screen(timeout: float = 30.0) -> str | None:
         )
         if child.after == "Loading usage data":
             child.expect(r"Current week \(all models\)", timeout=timeout)
-        child.expect(r"Extra usage", timeout=timeout)
+        
+        # We don't strictly expect "Extra usage" as it might be missing in some versions
+        try:
+            child.expect(r"Extra usage", timeout=5.0)
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            pass
+
         return strip_terminal_noise(transcript.getvalue())
     except (OSError, pexpect.ExceptionPexpect, pexpect.TIMEOUT, pexpect.EOF):
         return None
@@ -515,106 +522,101 @@ def capture_gemini_startup_screen(timeout: float = 20.0) -> str | None:
             child.close(force=True)
 
 
-def load_gemini_live_quota(timeout: float = 30.0) -> dict[str, JSONValue] | None:
+def load_gemini_live_quota(timeout: float = 60.0) -> dict[str, JSONValue] | None:
     gemini_path = resolve_command_path("gemini")
-    node_path = resolve_command_path("node")
-    if gemini_path is None or node_path is None:
+    if gemini_path is None:
         return None
 
-    gemini_package_root = Path(gemini_path).resolve().parent.parent
-    settings_js = gemini_package_root / "dist" / "src" / "config" / "settings.js"
-    config_js = gemini_package_root / "dist" / "src" / "config" / "config.js"
-    if not settings_js.exists() or not config_js.exists():
+    try:
+        import pexpect
+    except ImportError:
         return None
 
-    node_source = textwrap.dedent(
-        f"""
-        import {{ loadSettings }} from {json.dumps(str(settings_js))};
-        import {{ loadCliConfig }} from {json.dumps(str(config_js))};
-
-        const cwd = {json.dumps(str(Path.home()))};
-        const loadedSettings = loadSettings(cwd);
-        const argv = {{
-          query: undefined,
-          model: undefined,
-          sandbox: false,
-          debug: false,
-          prompt: undefined,
-          promptInteractive: undefined,
-          yolo: false,
-          approvalMode: 'default',
-          policy: undefined,
-          allowedMcpServerNames: undefined,
-          allowedTools: undefined,
-          acp: false,
-          experimentalAcp: false,
-          extensions: undefined,
-          listExtensions: false,
-          resume: undefined,
-          listSessions: false,
-          deleteSession: undefined,
-          includeDirectories: undefined,
-          screenReader: false,
-          useWriteTodos: undefined,
-          outputFormat: 'text',
-          fakeResponses: undefined,
-          recordResponses: undefined,
-          startupMessages: [],
-          rawOutput: false,
-          acceptRawOutputRisk: false,
-          isCommand: false,
-        }};
-
-        const config = await loadCliConfig(
-          loadedSettings.merged,
-          `probe-${{Date.now()}}`,
-          argv,
-          {{ cwd }},
-        );
-        await config.storage.initialize();
-        const authType = loadedSettings.merged.security?.auth?.selectedType;
-        if (authType) {{
-          await config.refreshAuth(authType);
-        }}
-        await config.initialize();
-        const quota = await config.refreshUserQuota();
-        const out = {{
-          authType,
-          tier: config.getUserTierName(),
-          paidTier: config.getUserPaidTier(),
-          quota,
-          pooledRemaining: config.getQuotaRemaining(),
-          pooledLimit: config.getQuotaLimit(),
-          pooledResetTime: config.getQuotaResetTime(),
-          model: config.getModel(),
-        }};
-        console.log({json.dumps(GEMINI_JSON_MARKER)} + JSON.stringify(out));
-        """
-    ).strip()
-
+    transcript = io.StringIO()
+    child: pexpect.spawn[str] | None = None
     env = command_environment()
     env.setdefault("TERM", "xterm-256color")
-    completed = subprocess.run(
-        [node_path, "--input-type=module", "-e", node_source],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
 
-    output = "\n".join(
-        part for part in (completed.stdout, completed.stderr) if part.strip()
-    )
-    for line in output.splitlines():
-        if not line.startswith(GEMINI_JSON_MARKER):
-            continue
+    try:
+        child = pexpect.spawn(
+            gemini_path,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+        child.logfile_read = transcript
+        # Wait for the prompt
+        child.expect([r"Type your message or @path/to/file", r"❯", r"›", r"> "], timeout=max(timeout, 30.0))
+        
+        # Send /stats command
+        child.send("/stats")
+        child.expect([r"/stats", r"stats"], timeout=timeout)
+        child.send("\r")
+        
+        # Wait for the stats table to appear
+        child.expect([r"Session Stats", r"Model usage"], timeout=timeout)
+        
+        # Give it a moment to finish rendering the table
         try:
-            loaded = json.loads(line.removeprefix(GEMINI_JSON_MARKER))
-        except json.JSONDecodeError:
-            return None
-        return loaded if isinstance(loaded, dict) else None
-    return None
+            child.expect([r"Type your message", r"❯", r"›", r"> "], timeout=15.0)
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            pass
+
+        full_output = strip_terminal_noise(transcript.getvalue())
+        return parse_gemini_stats_transcript(full_output)
+    except (OSError, pexpect.ExceptionPexpect, pexpect.TIMEOUT, pexpect.EOF):
+        return None
+    finally:
+        if child is not None and child.isalive():
+            child.close(force=True)
+
+
+def parse_gemini_stats_transcript(text: str) -> dict[str, JSONValue] | None:
+    tier_match = re.search(r"Tier:\s*(.+)", text)
+    auth_match = re.search(r"Auth Method:\s*.*?\((.+?)\)", text)
+    
+    tier = tier_match.group(1).strip() if tier_match else None
+    email = auth_match.group(1).strip() if auth_match else None
+    
+    # Model lines look like:
+    # │  gemini-2.5-flash           -    ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬    4%  10:13 PM (19h 52m)  │
+    # Note: Some names might be truncated with ellipsis
+    
+    buckets: list[dict[str, JSONValue]] = []
+    
+    for line in text.splitlines():
+        # Look for lines that start with a model-like ID (might have ellipsis)
+        # We match the prefix and then find the percentage
+        model_name_match = re.search(r"│\s+(gemini-[a-z0-9.-]+(?:…)?)\s+-\s+.*?\s+(\d+)%\s+(.+?)\s+│", line)
+        if model_name_match:
+            truncated_name = model_name_match.group(1).strip()
+            used_percent = float(model_name_match.group(2))
+            reset_time = model_name_match.group(3).strip()
+            
+            # Resolve truncated name if possible
+            actual_name = truncated_name
+            if truncated_name.endswith("…"):
+                prefix = truncated_name.rstrip("…")
+                for candidate in GEMINI_VISIBLE_MODEL_ORDER:
+                    if candidate.startswith(prefix):
+                        actual_name = candidate
+                        break
+            
+            buckets.append({
+                "modelId": actual_name,
+                "remainingFraction": (100.0 - used_percent) / 100.0,
+                "resetTime": reset_time
+            })
+            
+    if not buckets:
+        return None
+        
+    return {
+        "tier": tier,
+        "email": email,
+        "quota": {"buckets": buckets}
+    }
 
 
 def latest_file(paths: list[Path]) -> Path | None:
@@ -953,11 +955,22 @@ def gemini_status() -> ProviderStatus:
             if detail_text is not None:
                 detail_parts.append(detail_text)
 
+            remaining_values = sorted(
+                metric.percent_remaining
+                for metric in metrics.values()
+                if metric.percent_remaining is not None
+            )
+            summary = ""
+            if len(remaining_values) >= 2:
+                summary = f"{remaining_values[0]:.0f}% left · {remaining_values[1]:.0f}% next"
+            elif remaining_values:
+                summary = f"{remaining_values[0]:.0f}% left"
+
             return ProviderStatus(
                 key="gemini",
                 display_name="Gemini CLI",
                 available=True,
-                summary="",
+                summary=summary,
                 detail="\n".join(detail_parts),
                 source="gemini-cli-quota",
                 compact=compact,
