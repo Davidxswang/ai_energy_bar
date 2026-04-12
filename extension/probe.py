@@ -10,7 +10,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import textwrap
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -373,7 +372,7 @@ def capture_claude_usage_screen(timeout: float = 60.0) -> str | None:
         )
         if child.after == "Loading usage data":
             child.expect(r"Current week \(all models\)", timeout=timeout)
-        
+
         # We don't strictly expect "Extra usage" as it might be missing in some versions
         try:
             child.expect(r"Extra usage", timeout=5.0)
@@ -547,16 +546,19 @@ def load_gemini_live_quota(timeout: float = 60.0) -> dict[str, JSONValue] | None
         )
         child.logfile_read = transcript
         # Wait for the prompt
-        child.expect([r"Type your message or @path/to/file", r"❯", r"›", r"> "], timeout=max(timeout, 30.0))
-        
+        child.expect(
+            [r"Type your message or @path/to/file", r"❯", r"›", r"> "],
+            timeout=max(timeout, 30.0),
+        )
+
         # Send /stats command
         child.send("/stats")
         child.expect([r"/stats", r"stats"], timeout=timeout)
         child.send("\r")
-        
+
         # Wait for the stats table to appear
         child.expect([r"Session Stats", r"Model usage"], timeout=timeout)
-        
+
         # Give it a moment to finish rendering the table
         try:
             child.expect([r"Type your message", r"❯", r"›", r"> "], timeout=15.0)
@@ -575,25 +577,27 @@ def load_gemini_live_quota(timeout: float = 60.0) -> dict[str, JSONValue] | None
 def parse_gemini_stats_transcript(text: str) -> dict[str, JSONValue] | None:
     tier_match = re.search(r"Tier:\s*(.+)", text)
     auth_match = re.search(r"Auth Method:\s*.*?\((.+?)\)", text)
-    
+
     tier = tier_match.group(1).strip() if tier_match else None
     email = auth_match.group(1).strip() if auth_match else None
-    
+
     # Model lines look like:
     # │  gemini-2.5-flash           -    ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬    4%  10:13 PM (19h 52m)  │
     # Note: Some names might be truncated with ellipsis
-    
+
     buckets: list[dict[str, JSONValue]] = []
-    
+
     for line in text.splitlines():
         # Look for lines that start with a model-like ID (might have ellipsis)
         # We match the prefix and then find the percentage
-        model_name_match = re.search(r"│\s+(gemini-[a-z0-9.-]+(?:…)?)\s+-\s+.*?\s+(\d+)%\s+(.+?)\s+│", line)
+        model_name_match = re.search(
+            r"│\s+(gemini-[a-z0-9.-]+(?:…)?)\s+-\s+.*?\s+(\d+)%\s+(.+?)\s+│", line
+        )
         if model_name_match:
             truncated_name = model_name_match.group(1).strip()
             used_percent = float(model_name_match.group(2))
             reset_time = model_name_match.group(3).strip()
-            
+
             # Resolve truncated name if possible
             actual_name = truncated_name
             if truncated_name.endswith("…"):
@@ -602,21 +606,19 @@ def parse_gemini_stats_transcript(text: str) -> dict[str, JSONValue] | None:
                     if candidate.startswith(prefix):
                         actual_name = candidate
                         break
-            
-            buckets.append({
-                "modelId": actual_name,
-                "remainingFraction": (100.0 - used_percent) / 100.0,
-                "resetTime": reset_time
-            })
-            
+
+            buckets.append(
+                {
+                    "modelId": actual_name,
+                    "remainingFraction": (100.0 - used_percent) / 100.0,
+                    "resetTime": reset_time,
+                }
+            )
+
     if not buckets:
         return None
-        
-    return {
-        "tier": tier,
-        "email": email,
-        "quota": {"buckets": buckets}
-    }
+
+    return {"tier": tier, "email": email, "quota": {"buckets": buckets}}
 
 
 def latest_file(paths: list[Path]) -> Path | None:
@@ -795,30 +797,43 @@ def codex_status() -> ProviderStatus:
     _, rate_limits = find_latest_codex_rate_limits()
     primary = rate_limits.get("primary") if isinstance(rate_limits, dict) else None
     secondary = rate_limits.get("secondary") if isinstance(rate_limits, dict) else None
+    credits = rate_limits.get("credits") if isinstance(rate_limits, dict) else None
 
+    now = datetime.now().timestamp()
     five_hour = None
     weekly = None
-    if isinstance(primary, dict):
-        used_percent = primary.get("used_percent")
-        if isinstance(used_percent, (int, float)):
-            five_hour = safe_percent_remaining(float(used_percent))
-    if isinstance(secondary, dict):
-        used_percent = secondary.get("used_percent")
-        if isinstance(used_percent, (int, float)):
-            weekly = safe_percent_remaining(float(used_percent))
 
-    metrics: dict[str, LimitMetric] = {
-        "five_hour_limit": LimitMetric(
+    if isinstance(primary, dict):
+        resets_at = primary.get("resets_at")
+        if isinstance(resets_at, (int, float)) and now >= resets_at:
+            five_hour = 100.0
+        else:
+            used_percent = primary.get("used_percent")
+            if isinstance(used_percent, (int, float)):
+                five_hour = safe_percent_remaining(float(used_percent))
+
+    if isinstance(secondary, dict):
+        resets_at = secondary.get("resets_at")
+        if isinstance(resets_at, (int, float)) and now >= resets_at:
+            weekly = 100.0
+        else:
+            used_percent = secondary.get("used_percent")
+            if isinstance(used_percent, (int, float)):
+                weekly = safe_percent_remaining(float(used_percent))
+
+    metrics: dict[str, LimitMetric] = {}
+    if five_hour is not None:
+        metrics["five_hour_limit"] = LimitMetric(
             label="5-hour limit",
             percent_remaining=five_hour,
-            text=f"{five_hour:.0f}% left" if five_hour is not None else None,
-        ),
-        "weekly_limit": LimitMetric(
+            text=f"{five_hour:.0f}% left",
+        )
+    if weekly is not None:
+        metrics["weekly_limit"] = LimitMetric(
             label="Weekly limit",
             percent_remaining=weekly,
-            text=f"{weekly:.0f}% left" if weekly is not None else None,
-        ),
-    }
+            text=f"{weekly:.0f}% left",
+        )
 
     warning: str | None = None
     if weekly is not None and weekly < 25.0:
@@ -962,7 +977,9 @@ def gemini_status() -> ProviderStatus:
             )
             summary = ""
             if len(remaining_values) >= 2:
-                summary = f"{remaining_values[0]:.0f}% left · {remaining_values[1]:.0f}% next"
+                summary = (
+                    f"{remaining_values[0]:.0f}% left · {remaining_values[1]:.0f}% next"
+                )
             elif remaining_values:
                 summary = f"{remaining_values[0]:.0f}% left"
 
