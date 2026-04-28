@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -32,7 +33,6 @@ GEMINI_EMAIL_RE: Final[re.Pattern[str]] = re.compile(
 GEMINI_PLAN_RE: Final[re.Pattern[str]] = re.compile(
     r"Plan:\s*(.+?)(?:\s+/upgrade|\s*$)"
 )
-GEMINI_JSON_MARKER: Final[str] = "__GEMINI_QUOTA__"
 GEMINI_VISIBLE_MODEL_ORDER: Final[tuple[str, ...]] = (
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -355,31 +355,25 @@ def capture_claude_usage_screen(timeout: float = 60.0) -> str | None:
         child.logfile_read = transcript
         # Increase initial prompt timeout specifically, as startup can be slow
         child.expect([r"❯", r"│ >", r"›", r"> "], timeout=max(timeout, 30.0))
-        child.send("/status")
-        child.expect([r"/status", r"status"], timeout=timeout)
+        child.send("/usage")
+        child.expect([r"/usage", r"usage"], timeout=timeout)
         child.send("\t")
         child.send("\r")
-        child.expect(
-            [r"Status", r"Loading usage data", r"Current session"],
-            timeout=timeout,
-        )
-        child.send("\x1b[C")
-        child.expect([r"Search settings", r"Config"], timeout=timeout)
-        child.send("\x1b[C")
-        child.expect(
-            [r"Loading usage data", r"Current week \(all models\)"],
-            timeout=timeout,
-        )
-        if child.after == "Loading usage data":
-            child.expect(r"Current week \(all models\)", timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            cleaned = strip_terminal_noise(transcript.getvalue())
+            compact = compact_terminal_text(cleaned)
+            if "currentweek(allmodels)" in compact and "%used" in compact:
+                return cleaned
+            try:
+                child.expect(
+                    [r"Current", r"Curre", r"Resets", r"Extra", pexpect.TIMEOUT],
+                    timeout=2.0,
+                )
+            except pexpect.EOF:
+                break
 
-        # We don't strictly expect "Extra usage" as it might be missing in some versions
-        try:
-            child.expect(r"Extra usage", timeout=5.0)
-        except (pexpect.TIMEOUT, pexpect.EOF):
-            pass
-
-        return strip_terminal_noise(transcript.getvalue())
+        return None
     except (OSError, pexpect.ExceptionPexpect, pexpect.TIMEOUT, pexpect.EOF):
         return None
     finally:
@@ -392,14 +386,16 @@ def parse_claude_usage_screen(
 ) -> tuple[dict[str, LimitMetric], str | None, str | None, str | None]:
     lines = [line.strip() for line in screen_text.splitlines() if line.strip()]
     section_headers = {
-        "Current session",
-        "Current week (all models)",
-        "Extra usage",
-        "Status",
-        "Config",
-        "Usage",
-        "Press Esc to exit",
-        "Esc to cancel",
+        "currentsession",
+        "curretsession",
+        "currentweek(allmodels)",
+        "currentweek(sonnetonly)",
+        "extrausage",
+        "status",
+        "config",
+        "usage",
+        "pressesctoexit",
+        "esctocancel",
     }
 
     def normalize_reset_text(raw_reset: str | None) -> str | None:
@@ -416,20 +412,22 @@ def parse_claude_usage_screen(
         )
         normalized = re.sub(r"^Resets\s+in(?=\S)", "Resets in ", normalized)
         normalized = re.sub(r"^Resets(?=\S)", "Resets ", normalized)
+        normalized = prettify_compact_claude_text(normalized)
         return (
             normalized if normalized.startswith("Resets ") else f"Resets {normalized}"
         )
 
     def is_section_header(line: str) -> bool:
-        return line in section_headers
+        compact = compact_terminal_text(line)
+        return compact in section_headers
 
     def looks_like_reset_line(line: str) -> bool:
         squashed = re.sub(r"\s+", "", line).lower()
         return squashed.startswith(("resets", "reset", "reses"))
 
-    def extract_usage_block(label: str) -> tuple[float | None, str | None]:
+    def extract_usage_block(labels: set[str]) -> tuple[float | None, str | None]:
         for index, line in enumerate(lines):
-            if label not in line:
+            if compact_terminal_text(line) not in labels:
                 continue
             block_lines: list[str] = []
             for candidate in lines[index + 1 : index + 8]:
@@ -454,20 +452,20 @@ def parse_claude_usage_screen(
 
     def extract_extra_usage() -> str | None:
         for index, line in enumerate(lines):
-            if line != "Extra usage":
+            if compact_terminal_text(line) != "extrausage":
                 continue
             for candidate in lines[index + 1 : index + 5]:
-                if candidate not in {
-                    "Usage",
-                    "Status",
-                    "Config",
-                    "Press Esc to exit",
-                }:
-                    return candidate
+                compact = compact_terminal_text(candidate)
+                if compact in section_headers or "%used" in compact:
+                    continue
+                if candidate:
+                    return prettify_compact_claude_text(candidate)
         return None
 
-    session_remaining, session_reset = extract_usage_block("Current session")
-    week_remaining, week_reset = extract_usage_block("Current week (all models)")
+    session_remaining, session_reset = extract_usage_block(
+        {"currentsession", "curretsession"}
+    )
+    week_remaining, week_reset = extract_usage_block({"currentweek(allmodels)"})
     extra_usage = extract_extra_usage()
     metrics = {
         "current_session": LimitMetric(
@@ -519,6 +517,20 @@ def capture_gemini_startup_screen(timeout: float = 20.0) -> str | None:
     finally:
         if child is not None and child.isalive():
             child.close(force=True)
+
+
+def compact_terminal_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
+
+
+def prettify_compact_claude_text(text: str) -> str:
+    pretty = text.replace("spent·Resets", "spent · Resets ")
+    pretty = re.sub(r"(?<=\d)spent", " spent", pretty)
+    pretty = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", pretty)
+    pretty = re.sub(r",(?=\d)", ", ", pretty)
+    pretty = re.sub(r"(?<=\d)(am|pm)\(", r"\1 (", pretty, flags=re.IGNORECASE)
+    pretty = re.sub(r"(?<=\d)\(", " (", pretty)
+    return pretty
 
 
 def load_gemini_live_quota(timeout: float = 60.0) -> dict[str, JSONValue] | None:
@@ -768,6 +780,46 @@ def parse_gemini_quota_metrics(
     return metrics, tier_text, current_model_text, detail_text
 
 
+def parse_gemini_startup_quota(
+    screen_text: str,
+) -> tuple[dict[str, LimitMetric], str | None, str | None, str | None]:
+    tier_match = GEMINI_PLAN_RE.search(screen_text)
+    tier_text = tier_match.group(1).strip() if tier_match is not None else None
+
+    for line in screen_text.splitlines():
+        if "% used" not in line:
+            continue
+        columns = [
+            column.strip() for column in re.split(r"\s{2,}", line) if column.strip()
+        ]
+        if len(columns) < 2:
+            continue
+        used_match = re.fullmatch(r"(\d+(?:\.\d+)?)%\s*used", columns[-1])
+        if used_match is None:
+            continue
+
+        used_percent = float(used_match.group(1))
+        percent_remaining = safe_percent_remaining(used_percent)
+        current_model = columns[-2]
+        metrics = {
+            "current_quota": LimitMetric(
+                label="Current quota",
+                percent_remaining=percent_remaining,
+                text=(
+                    f"{percent_remaining:.0f}% left"
+                    if percent_remaining is not None
+                    else None
+                ),
+            )
+        }
+        detail_parts = [f"{current_model}: {used_percent:.0f}% used"]
+        if tier_text is not None:
+            detail_parts.append(tier_text)
+        return metrics, tier_text, current_model, "\n".join(detail_parts)
+
+    return {}, tier_text, None, None
+
+
 def gemini_compact_label(metrics: dict[str, LimitMetric]) -> str:
     remaining_values = sorted(
         metric.percent_remaining
@@ -797,7 +849,6 @@ def codex_status() -> ProviderStatus:
     _, rate_limits = find_latest_codex_rate_limits()
     primary = rate_limits.get("primary") if isinstance(rate_limits, dict) else None
     secondary = rate_limits.get("secondary") if isinstance(rate_limits, dict) else None
-    credits = rate_limits.get("credits") if isinstance(rate_limits, dict) else None
 
     now = datetime.now().timestamp()
     five_hour = None
@@ -947,6 +998,32 @@ def gemini_status() -> ProviderStatus:
         )
 
     version_text = normalize_version_text(version, "gemini")
+    startup_screen = capture_gemini_startup_screen()
+    if startup_screen is not None:
+        metrics, _tier_text, _current_model_text, detail_text = (
+            parse_gemini_startup_quota(startup_screen)
+        )
+        quota_remaining = metrics.get("current_quota")
+        percent_remaining = (
+            quota_remaining.percent_remaining if quota_remaining is not None else None
+        )
+        if percent_remaining is not None:
+            warning: str | None = None
+            if percent_remaining < 25.0:
+                warning = "Gemini quota is below 25%."
+
+            return ProviderStatus(
+                key="gemini",
+                display_name="Gemini CLI",
+                available=True,
+                summary=f"{percent_remaining:.0f}% left",
+                detail=detail_text or "",
+                source="gemini-startup-quota",
+                compact=f"Ge {percent_remaining:.0f}",
+                warning=warning,
+                version=version_text,
+                metrics=metrics,
+            )
 
     live_quota = load_gemini_live_quota()
     if isinstance(live_quota, dict):
@@ -995,8 +1072,6 @@ def gemini_status() -> ProviderStatus:
                 version=version_text,
                 metrics=metrics,
             )
-
-    startup_screen = capture_gemini_startup_screen()
 
     return ProviderStatus(
         key="gemini",
