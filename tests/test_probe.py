@@ -5,6 +5,7 @@ from extension.probe import (
     gemini_compact_label,
     parse_claude_usage_screen,
     parse_gemini_quota_metrics,
+    parse_gemini_startup_quota,
     safe_percent_remaining,
     short_plan,
 )
@@ -122,6 +123,57 @@ def test_parse_claude_usage_screen_handles_mangled_session_reset_line() -> None:
     assert session_reset == "Resets 10pm (America/Los_Angeles)"
     assert week_reset == "Resets Mar 24, 11pm (America/Los_Angeles)"
     assert extra_usage == "Extra usage not enabled • /extra-usage to enable"
+
+
+def test_parse_claude_usage_screen_handles_compact_usage_dialog_text() -> None:
+    screen_text = """
+    Curretsession
+    ██4%used
+    Reses1:20am(America/Los_Angeles)
+
+    Currentweek(allmodels)
+    ██████████████████████44%used
+    ResetsMay1,2pm(America/Los_Angeles)
+
+    Currentweek(Sonnetonly)
+    █████████████26%used
+    ResetsMay1,2pm(America/Los_Angeles)
+
+    Extrausage
+    █▎2%used
+    $4.89/$200.00spent·ResetsMay1(America/Los_Angeles)
+    """
+
+    metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
+        screen_text
+    )
+
+    assert metrics["current_session"].percent_remaining == 96.0
+    assert metrics["current_week"].percent_remaining == 56.0
+    assert session_reset == "Resets 1:20am (America/Los_Angeles)"
+    assert week_reset == "Resets May 1, 2pm (America/Los_Angeles)"
+    assert extra_usage == "$4.89/$200.00 spent · Resets May 1 (America/Los_Angeles)"
+
+
+def test_parse_gemini_startup_quota_extracts_footer_quota() -> None:
+    screen_text = """
+    Gemini CLI v0.39.1
+    Signed in with Google /auth
+    Plan: Gemini Code Assist in Google One AI Pro /upgrade
+
+     workspace (/directory)      branch    sandbox       /model               quota
+     ~/projects/ai_energy_bar    main      no sandbox    Auto (Gemini 3)    3% used
+    """
+
+    metrics, tier_text, current_model_text, detail_text = parse_gemini_startup_quota(
+        screen_text
+    )
+
+    assert tier_text == "Gemini Code Assist in Google One AI Pro"
+    assert current_model_text == "Auto (Gemini 3)"
+    assert detail_text is not None
+    assert "Auto (Gemini 3): 3% used" in detail_text
+    assert metrics["current_quota"].percent_remaining == 97.0
 
 
 def test_resolve_command_path_falls_back_to_login_shell(monkeypatch) -> None:
