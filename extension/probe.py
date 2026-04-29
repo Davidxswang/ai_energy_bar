@@ -396,6 +396,9 @@ def parse_claude_usage_screen(
         "usage",
         "pressesctoexit",
         "esctocancel",
+        "what'scontributingtoyourlimitsusage?",
+        "scanninglocalsessions…",
+        "refreshing…",
     }
 
     def normalize_reset_text(raw_reset: str | None) -> str | None:
@@ -511,6 +514,15 @@ def capture_gemini_startup_screen(timeout: float = 20.0) -> str | None:
         )
         child.logfile_read = transcript
         child.expect(r"Type your message or @path/to/file", timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            cleaned = strip_terminal_noise(transcript.getvalue())
+            if re.search(r"\d+(?:\.\d+)?%\s*used", cleaned):
+                return cleaned
+            try:
+                child.expect([r"\d+(?:\.\d+)?%\s*used", pexpect.TIMEOUT], timeout=1.0)
+            except pexpect.EOF:
+                break
         return strip_terminal_noise(transcript.getvalue())
     except (OSError, pexpect.ExceptionPexpect, pexpect.TIMEOUT, pexpect.EOF):
         return None
@@ -1025,7 +1037,7 @@ def gemini_status() -> ProviderStatus:
                 metrics=metrics,
             )
 
-    live_quota = load_gemini_live_quota()
+    live_quota = load_gemini_live_quota(timeout=12.0)
     if isinstance(live_quota, dict):
         metrics, _tier_text, _current_model_text, detail_text = (
             parse_gemini_quota_metrics(live_quota)

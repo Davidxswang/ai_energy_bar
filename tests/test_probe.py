@@ -155,6 +155,34 @@ def test_parse_claude_usage_screen_handles_compact_usage_dialog_text() -> None:
     assert extra_usage == "$4.89/$200.00 spent · Resets May 1 (America/Los_Angeles)"
 
 
+def test_parse_claude_usage_screen_stops_week_reset_at_contribution_section() -> None:
+    screen_text = """
+    Currentsession
+    ██25%used
+    Resets2:10am(America/Los_Angeles)
+
+    Currentweek(allmodels)
+    █████████████████████████50%used
+    ResetsMay1,2pm(America/Los_Angeles)
+
+    What'scontributingtoyourlimitsusage?
+    Approximate,basedonlocalsessionsonthismachine—doesnotinclude
+    otherdevicesorclaude.ai
+    Scanninglocalsessions…
+    Refreshing…
+    """
+
+    metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
+        screen_text
+    )
+
+    assert metrics["current_session"].percent_remaining == 75.0
+    assert metrics["current_week"].percent_remaining == 50.0
+    assert session_reset == "Resets 2:10am (America/Los_Angeles)"
+    assert week_reset == "Resets May 1, 2pm (America/Los_Angeles)"
+    assert extra_usage is None
+
+
 def test_parse_gemini_startup_quota_extracts_footer_quota() -> None:
     screen_text = """
     Gemini CLI v0.39.1
