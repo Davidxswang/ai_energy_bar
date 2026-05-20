@@ -6,10 +6,12 @@ import dataclasses
 import io
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -645,51 +647,118 @@ def parse_gemini_stats_transcript(text: str) -> dict[str, JSONValue] | None:
     return {"tier": tier, "email": email, "quota": {"buckets": buckets}}
 
 
-def latest_file(paths: list[Path]) -> Path | None:
-    if not paths:
+def normalize_codex_rate_limits(
+    payload: JSONValue | None,
+) -> dict[str, JSONValue] | None:
+    """Reshape app-server rate limits into the snake_case form codex_status reads."""
+    if not isinstance(payload, dict):
         return None
-    return max(paths, key=lambda path: path.stat().st_mtime)
+
+    def window(raw: JSONValue | None) -> dict[str, float] | None:
+        if not isinstance(raw, dict):
+            return None
+        bucket: dict[str, float] = {}
+        used = raw.get("usedPercent")
+        if isinstance(used, (int, float)):
+            bucket["used_percent"] = float(used)
+        resets = raw.get("resetsAt")
+        if isinstance(resets, (int, float)):
+            bucket["resets_at"] = float(resets)
+        return bucket or None
+
+    normalized: dict[str, JSONValue] = {}
+    primary = window(payload.get("primary"))
+    if primary is not None:
+        normalized["primary"] = primary
+    secondary = window(payload.get("secondary"))
+    if secondary is not None:
+        normalized["secondary"] = secondary
+    return normalized or None
 
 
-def find_latest_codex_rate_limits() -> tuple[str | None, dict[str, JSONValue] | None]:
-    sessions_root = Path.home() / ".codex" / "sessions"
-    if not sessions_root.exists():
-        return None, None
+def fetch_codex_rate_limits(timeout: float = 10.0) -> dict[str, JSONValue] | None:
+    # Codex 0.130+ writes rate_limits=null in session jsonl; live data only comes from
+    # the app-server `account/rateLimits/read` RPC.
+    codex_path = resolve_command_path("codex")
+    if codex_path is None:
+        return None
 
-    session_files = sorted(
-        sessions_root.rglob("*.jsonl"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:20]
+    try:
+        proc = subprocess.Popen(
+            [codex_path, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=command_environment(),
+        )
+    except OSError:
+        return None
 
-    best_timestamp: str | None = None
-    best_rate_limits: dict[str, JSONValue] | None = None
+    if proc.stdin is None or proc.stdout is None:
+        proc.kill()
+        return None
 
-    for path in session_files:
+    response_q: queue.Queue[str] = queue.Queue()
+
+    def pump_stdout() -> None:
+        # proc.stdout was non-None above; loop terminates when the pipe closes.
+        assert proc.stdout is not None
         try:
-            for line in path.read_text(errors="ignore").splitlines():
-                if '"rate_limits"' not in line:
-                    continue
-                loaded = json.loads(line)
-                if not isinstance(loaded, dict):
-                    continue
+            for raw_line in proc.stdout:
+                response_q.put(raw_line)
+        except (OSError, ValueError):
+            pass
 
-                timestamp = loaded.get("timestamp")
-                payload = loaded.get("payload")
-                if not isinstance(timestamp, str) or not isinstance(payload, dict):
-                    continue
+    threading.Thread(target=pump_stdout, daemon=True).start()
 
-                rate_limits = payload.get("rate_limits")
-                if not isinstance(rate_limits, dict):
-                    continue
+    try:
+        for message in (
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "ai_energy_bar", "version": "0.1.0"},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "account/rateLimits/read",
+                "params": {},
+            },
+        ):
+            proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
 
-                if best_timestamp is None or timestamp > best_timestamp:
-                    best_timestamp = timestamp
-                    best_rate_limits = rate_limits
-        except (OSError, json.JSONDecodeError):
-            continue
-
-    return best_timestamp, best_rate_limits
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                line = response_q.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict) or msg.get("id") != 2:
+                continue
+            result = msg.get("result")
+            if not isinstance(result, dict):
+                return None
+            return normalize_codex_rate_limits(result.get("rateLimits"))
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def normalize_version_text(version: str | None, prefix: str) -> str | None:
@@ -858,7 +927,7 @@ def codex_status() -> ProviderStatus:
             compact="Cx --",
         )
 
-    _, rate_limits = find_latest_codex_rate_limits()
+    rate_limits = fetch_codex_rate_limits()
     primary = rate_limits.get("primary") if isinstance(rate_limits, dict) else None
     secondary = rate_limits.get("secondary") if isinstance(rate_limits, dict) else None
 
@@ -907,10 +976,10 @@ def codex_status() -> ProviderStatus:
         detail = ""
         compact = f"Cx {five_hour:.0f}/{weekly:.0f}"
     else:
-        summary = "No recent Codex rate-limit event found"
+        summary = "Codex quota unavailable"
         detail = (
-            "Open Codex once in this account so the local session log contains "
-            "rate-limit state."
+            "`codex app-server` did not return rate-limit data. Make sure you are "
+            "signed in (`codex login`) and that `codex app-server` runs."
         )
         compact = "Cx --"
 
@@ -920,7 +989,7 @@ def codex_status() -> ProviderStatus:
         available=True,
         summary=summary,
         detail=detail,
-        source="codex-session-jsonl",
+        source="codex-app-server",
         compact=compact,
         warning=warning,
         version=normalize_version_text(version, "codex-cli"),
