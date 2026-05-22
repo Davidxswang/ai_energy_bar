@@ -1,15 +1,13 @@
-from extension import probe
-from extension.probe import (
-    JSONValue,
-    LimitMetric,
-    gemini_compact_label,
-    normalize_codex_rate_limits,
-    parse_claude_usage_screen,
+from extension._probe import shell
+from extension._probe.claude import parse_claude_usage_screen
+from extension._probe.codex import normalize_codex_rate_limits
+from extension._probe.gemini import gemini_compact_label
+from extension._probe.gemini_parse import (
     parse_gemini_quota_metrics,
     parse_gemini_startup_quota,
-    safe_percent_remaining,
-    short_plan,
 )
+from extension._probe.models import JSONValue, LimitMetric
+from extension._probe.text import safe_percent_remaining, short_plan
 
 
 def test_short_plan_normalizes_common_tiers() -> None:
@@ -236,22 +234,22 @@ def test_normalize_codex_rate_limits_returns_none_for_missing_payload() -> None:
 
 
 def test_resolve_command_path_falls_back_to_login_shell(monkeypatch) -> None:
-    probe.resolve_command_path.cache_clear()
-    monkeypatch.setattr(probe.shutil, "which", lambda command: None)
+    shell.resolve_command_path.cache_clear()
+    monkeypatch.setattr(shell.shutil, "which", lambda command: None)
     monkeypatch.setenv("SHELL", "/bin/sh")
 
     def fake_run(*args, **kwargs):
-        return probe.subprocess.CompletedProcess(
+        return shell.subprocess.CompletedProcess(
             args=args[0],
             returncode=0,
             stdout="/mock/bin/claude\n",
             stderr="",
         )
 
-    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    monkeypatch.setattr(shell.subprocess, "run", fake_run)
 
-    assert probe.resolve_command_path("claude") == "/mock/bin/claude"
-    probe.resolve_command_path.cache_clear()
+    assert shell.resolve_command_path("claude") == "/mock/bin/claude"
+    shell.resolve_command_path.cache_clear()
 
 
 def test_resolve_command_path_uses_fallback_bin_dirs(monkeypatch, tmp_path) -> None:
@@ -261,25 +259,25 @@ def test_resolve_command_path_uses_fallback_bin_dirs(monkeypatch, tmp_path) -> N
     fake_command.write_text("#!/bin/sh\n")
     fake_command.chmod(0o755)
 
-    probe.resolve_command_path.cache_clear()
-    monkeypatch.setattr(probe.shutil, "which", lambda command: None)
+    shell.resolve_command_path.cache_clear()
+    monkeypatch.setattr(shell.shutil, "which", lambda command: None)
     monkeypatch.delenv("SHELL", raising=False)
-    monkeypatch.setattr(probe, "fallback_bin_dirs", lambda: [fake_bin])
+    monkeypatch.setattr(shell, "fallback_bin_dirs", lambda: [fake_bin])
 
-    assert probe.resolve_command_path("gemini") == str(fake_command)
-    probe.resolve_command_path.cache_clear()
+    assert shell.resolve_command_path("gemini") == str(fake_command)
+    shell.resolve_command_path.cache_clear()
 
 
 def test_command_environment_includes_fallback_path(monkeypatch, tmp_path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
 
-    probe.resolve_login_shell_path.cache_clear()
+    shell.resolve_login_shell_path.cache_clear()
     monkeypatch.delenv("SHELL", raising=False)
     monkeypatch.setenv("PATH", "")
-    monkeypatch.setattr(probe, "fallback_bin_dirs", lambda: [fake_bin])
+    monkeypatch.setattr(shell, "fallback_bin_dirs", lambda: [fake_bin])
 
-    env = probe.command_environment()
+    env = shell.command_environment()
 
     assert env["PATH"] == str(fake_bin)
-    probe.resolve_login_shell_path.cache_clear()
+    shell.resolve_login_shell_path.cache_clear()

@@ -24,6 +24,7 @@ cp "$SOURCE_DIR/extension.js" "$TARGET_DIR/extension.js"
 cp "$SOURCE_DIR/metadata.json" "$TARGET_DIR/metadata.json"
 cp "$SOURCE_DIR/probe.py" "$TARGET_DIR/probe.py"
 cp "$SOURCE_DIR/stylesheet.css" "$TARGET_DIR/stylesheet.css"
+cp -R "$SOURCE_DIR/_probe" "$TARGET_DIR/_probe"
 touch "$TARGET_DIR/$MARKER_FILE"
 printf '%s\n' "$ROOT_DIR" > "$TARGET_DIR/$REPO_ROOT_HINT_FILE"
 
