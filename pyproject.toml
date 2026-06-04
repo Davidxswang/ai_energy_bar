@@ -8,6 +8,13 @@ dependencies = [
   "pexpect>=4.9.0",
 ]
 
+[project.optional-dependencies]
+# macOS menu bar front-end. The marker keeps `uv sync --extra macos` a no-op on
+# Linux/CI, where rumps (PyObjC) cannot build.
+macos = [
+  "rumps>=0.4.0 ; sys_platform == 'darwin'",
+]
+
 [dependency-groups]
 dev = [
   "pytest>=8.4.0",
