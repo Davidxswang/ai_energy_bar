@@ -1,185 +1,180 @@
 from __future__ import annotations
 
-import io
-import re
-import time
+import http.client
+import json
+import urllib.error
+import urllib.request
+from pathlib import Path
 from typing import Final
 
-from .models import PROJECT_ROOT, LimitMetric, ProviderStatus
-from .shell import command_environment, get_version, resolve_command_path
-from .text import (
-    compact_terminal_text,
-    normalize_version_text,
-    prettify_compact_claude_text,
-    safe_percent_remaining,
-    strip_terminal_noise,
-)
+from .models import JSONValue, LimitMetric, ProviderStatus
+from .shell import get_version
+from .text import format_reset_time, normalize_version_text, safe_percent_remaining
 
-CLAUDE_PERCENT_USED_RE: Final[re.Pattern[str]] = re.compile(
-    r"(\d+(?:\.\d+)?)%\s*used",
-    re.IGNORECASE,
-)
+CLAUDE_CREDENTIALS_PATH: Final[Path] = Path.home() / ".claude" / ".credentials.json"
+CLAUDE_USAGE_URL: Final[str] = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_OAUTH_BETA: Final[str] = "oauth-2025-04-20"
+USAGE_TIMEOUT_SECONDS: Final[float] = 6.0
 
 
-def capture_claude_usage_screen(timeout: float = 60.0) -> str | None:
-    claude_path = resolve_command_path("claude")
-    if claude_path is None:
-        return None
+def read_claude_oauth_token() -> str | None:
+    """Return the Claude Code subscription OAuth access token, or None.
 
+    Claude Code (Linux) persists its OAuth token at
+    ``~/.claude/.credentials.json`` under ``claudeAiOauth.accessToken`` and
+    refreshes it on use. We read it directly instead of driving the CLI's
+    interactive ``/usage`` screen.
+    """
     try:
-        import pexpect
-    except ImportError:
+        raw = CLAUDE_CREDENTIALS_PATH.read_text()
+    except OSError:
         return None
-
-    transcript = io.StringIO()
-    child: pexpect.spawn[str] | None = None
-    env = command_environment()
-    env.setdefault("TERM", "xterm-256color")
-
     try:
-        child = pexpect.spawn(
-            claude_path,
-            ["--permission-mode", "plan"],
-            cwd=str(PROJECT_ROOT),
-            env=env,
-            encoding="utf-8",
-            timeout=timeout,
-        )
-        child.logfile_read = transcript
-        # Increase initial prompt timeout specifically, as startup can be slow
-        child.expect([r"❯", r"│ >", r"›", r"> "], timeout=max(timeout, 30.0))
-        child.send("/usage")
-        child.expect([r"/usage", r"usage"], timeout=timeout)
-        child.send("\t")
-        child.send("\r")
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            cleaned = strip_terminal_noise(transcript.getvalue())
-            compact = compact_terminal_text(cleaned)
-            if "currentweek(allmodels)" in compact and "%used" in compact:
-                return cleaned
-            try:
-                child.expect(
-                    [r"Current", r"Curre", r"Resets", r"Extra", pexpect.TIMEOUT],
-                    timeout=2.0,
-                )
-            except pexpect.EOF:
-                break
-
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
         return None
-    except (OSError, pexpect.ExceptionPexpect, pexpect.TIMEOUT, pexpect.EOF):
+    if not isinstance(loaded, dict):
         return None
-    finally:
-        if child is not None and child.isalive():
-            child.close(force=True)
-
-
-def parse_claude_usage_screen(
-    screen_text: str,
-) -> tuple[dict[str, LimitMetric], str | None, str | None, str | None]:
-    lines = [line.strip() for line in screen_text.splitlines() if line.strip()]
-    section_headers = {
-        "currentsession",
-        "curretsession",
-        "currentweek(allmodels)",
-        "currentweek(sonnetonly)",
-        "extrausage",
-        "status",
-        "config",
-        "usage",
-        "pressesctoexit",
-        "esctocancel",
-        "what'scontributingtoyourlimitsusage?",
-        "scanninglocalsessions…",
-        "refreshing…",
-    }
-
-    def normalize_reset_text(raw_reset: str | None) -> str | None:
-        if raw_reset is None:
-            return None
-        normalized = re.sub(r"\s+", " ", raw_reset).strip().rstrip(".")
-        if not normalized:
-            return None
-        normalized = re.sub(
-            r"^(?:resets?|reset|reses)\s*",
-            "Resets ",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-        normalized = re.sub(r"^Resets\s+in(?=\S)", "Resets in ", normalized)
-        normalized = re.sub(r"^Resets(?=\S)", "Resets ", normalized)
-        normalized = prettify_compact_claude_text(normalized)
-        return (
-            normalized if normalized.startswith("Resets ") else f"Resets {normalized}"
-        )
-
-    def is_section_header(line: str) -> bool:
-        compact = compact_terminal_text(line)
-        return compact in section_headers
-
-    def looks_like_reset_line(line: str) -> bool:
-        squashed = re.sub(r"\s+", "", line).lower()
-        return squashed.startswith(("resets", "reset", "reses"))
-
-    def extract_usage_block(labels: set[str]) -> tuple[float | None, str | None]:
-        for index, line in enumerate(lines):
-            if compact_terminal_text(line) not in labels:
-                continue
-            block_lines: list[str] = []
-            for candidate in lines[index + 1 : index + 8]:
-                if is_section_header(candidate):
-                    break
-                block_lines.append(candidate)
-
-            block_text = " ".join(block_lines)
-            percent_used: float | None = None
-            reset_text: str | None = None
-            used_match = CLAUDE_PERCENT_USED_RE.search(block_text)
-            if used_match is not None:
-                percent_used = float(used_match.group(1))
-            for reset_index, candidate in enumerate(block_lines):
-                if not looks_like_reset_line(candidate):
-                    continue
-                reset_fragments = [candidate, *block_lines[reset_index + 1 :]]
-                reset_text = normalize_reset_text(" ".join(reset_fragments))
-                break
-            return safe_percent_remaining(percent_used), reset_text
-        return None, None
-
-    def extract_extra_usage() -> str | None:
-        for index, line in enumerate(lines):
-            if compact_terminal_text(line) != "extrausage":
-                continue
-            for candidate in lines[index + 1 : index + 5]:
-                compact = compact_terminal_text(candidate)
-                if compact in section_headers or "%used" in compact:
-                    continue
-                if candidate:
-                    return prettify_compact_claude_text(candidate)
+    oauth = loaded.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
         return None
+    token = oauth.get("accessToken")
+    return token if isinstance(token, str) and token else None
 
-    session_remaining, session_reset = extract_usage_block(
-        {"currentsession", "curretsession"}
+
+def fetch_claude_usage(
+    timeout: float = USAGE_TIMEOUT_SECONDS,
+    user_agent: str | None = None,
+) -> dict[str, JSONValue] | None:
+    """Fetch the live usage summary from the Claude OAuth usage endpoint.
+
+    Mirrors what the interactive ``/usage`` screen calls under the hood:
+    ``GET /api/oauth/usage`` with the subscription OAuth bearer token. Returns
+    the decoded JSON object, or ``None`` on any auth/network/parse failure so
+    the bar degrades to "unavailable" instead of hanging.
+    """
+    token = read_claude_oauth_token()
+    if token is None:
+        return None
+    request = urllib.request.Request(
+        CLAUDE_USAGE_URL,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": CLAUDE_OAUTH_BETA,
+            "Content-Type": "application/json",
+            "User-Agent": user_agent or "claude-cli (external, cli)",
+        },
     )
-    week_remaining, week_reset = extract_usage_block({"currentweek(allmodels)"})
-    extra_usage = extract_extra_usage()
-    metrics = {
-        "current_session": LimitMetric(
-            label="Current session",
-            percent_remaining=session_remaining,
-            text=(
-                f"{session_remaining:.0f}% left"
-                if session_remaining is not None
-                else None
-            ),
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read()
+    except (
+        # Best-effort fetch: never let a flaky read crash the combined probe
+        # (that would blank Codex/Gemini too). URLError covers HTTPError (e.g. a
+        # 401 on an expired token) + DNS/SSL via OSError; HTTPException covers
+        # IncompleteRead/BadStatusLine; ValueError covers a malformed token in
+        # the header (and keeps it out of any propagated traceback/stderr).
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        http.client.HTTPException,
+        ValueError,
+    ):
+        return None
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _limit_metric(
+    data: dict[str, JSONValue], key: str, label: str
+) -> tuple[LimitMetric, str | None]:
+    """Build a ``LimitMetric`` (+ formatted reset time) from one usage bucket.
+
+    Each bucket looks like ``{"utilization": <percent_used 0-100>,
+    "resets_at": <iso8601>}``; absent/null buckets yield an empty metric.
+    """
+    bucket = data.get(key)
+    percent_remaining: float | None = None
+    reset_text: str | None = None
+    if isinstance(bucket, dict):
+        utilization = bucket.get("utilization")
+        if isinstance(utilization, (int, float)) and not isinstance(utilization, bool):
+            percent_remaining = safe_percent_remaining(float(utilization))
+        resets_at = bucket.get("resets_at")
+        if isinstance(resets_at, str):
+            reset_text = format_reset_time(resets_at)
+    metric = LimitMetric(
+        label=label,
+        percent_remaining=percent_remaining,
+        text=(
+            f"{percent_remaining:.0f}% left" if percent_remaining is not None else None
         ),
-        "current_week": LimitMetric(
-            label="Current week",
-            percent_remaining=week_remaining,
-            text=f"{week_remaining:.0f}% left" if week_remaining is not None else None,
-        ),
+    )
+    return metric, reset_text
+
+
+def _money(amount: JSONValue) -> str | None:
+    """Format a ``{amount_minor, exponent, currency}`` money object as text."""
+    if not isinstance(amount, dict):
+        return None
+    minor = amount.get("amount_minor")
+    exponent = amount.get("exponent")
+    if isinstance(minor, bool) or not isinstance(minor, (int, float)):
+        return None
+    if isinstance(exponent, bool) or not isinstance(exponent, int):
+        return None
+    value = minor / (10**exponent)
+    digits = max(exponent, 0)
+    currency = amount.get("currency")
+    if currency == "USD":
+        return f"${value:.{digits}f}"
+    if isinstance(currency, str) and currency:
+        return f"{value:.{digits}f} {currency}"
+    return f"{value:.{digits}f}"
+
+
+def _extra_usage_text(data: dict[str, JSONValue]) -> str | None:
+    """Summarize the extra-usage (overage) state for the detail tooltip."""
+    extra = data.get("extra_usage")
+    if not isinstance(extra, dict):
+        return None
+    if extra.get("is_enabled") is not True:
+        return "Extra usage not enabled"
+    spend = data.get("spend")
+    if isinstance(spend, dict):
+        used = _money(spend.get("used"))
+        limit = _money(spend.get("limit"))
+        if used is not None and limit is not None:
+            return f"extra usage {used} / {limit}"
+    return "Extra usage enabled"
+
+
+def parse_claude_usage(
+    data: dict[str, JSONValue],
+) -> tuple[dict[str, LimitMetric], str | None, str | None, str | None]:
+    """Map ``/api/oauth/usage`` JSON to (metrics, session_reset, week_reset, extra).
+
+    ``five_hour`` is the rolling session limit; ``seven_day`` the weekly
+    all-models limit. Per-model weekly buckets (``seven_day_sonnet`` /
+    ``seven_day_opus``) are included only when present.
+    """
+    session_metric, session_reset = _limit_metric(data, "five_hour", "Current session")
+    week_metric, week_reset = _limit_metric(data, "seven_day", "Current week")
+    metrics: dict[str, LimitMetric] = {
+        "current_session": session_metric,
+        "current_week": week_metric,
     }
-    return metrics, session_reset, week_reset, extra_usage
+    sonnet_metric, _ = _limit_metric(data, "seven_day_sonnet", "Current week (Sonnet)")
+    if sonnet_metric.percent_remaining is not None:
+        metrics["current_week_sonnet"] = sonnet_metric
+    opus_metric, _ = _limit_metric(data, "seven_day_opus", "Current week (Opus)")
+    if opus_metric.percent_remaining is not None:
+        metrics["current_week_opus"] = opus_metric
+    return metrics, session_reset, week_reset, _extra_usage_text(data)
 
 
 def claude_status() -> ProviderStatus:
@@ -196,11 +191,10 @@ def claude_status() -> ProviderStatus:
         )
 
     version_text = normalize_version_text(version, "claude")
-    usage_screen = capture_claude_usage_screen()
-    if usage_screen is not None:
-        metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
-            usage_screen
-        )
+    user_agent = f"claude-cli/{version_text} (external, cli)" if version_text else None
+    usage = fetch_claude_usage(user_agent=user_agent)
+    if usage is not None:
+        metrics, session_reset, week_reset, extra_usage = parse_claude_usage(usage)
         session_remaining = metrics["current_session"].percent_remaining
         week_remaining = metrics["current_week"].percent_remaining
         if session_remaining is not None and week_remaining is not None:
@@ -212,14 +206,11 @@ def claude_status() -> ProviderStatus:
 
             detail_parts: list[str] = []
             if session_reset is not None:
-                detail_parts.append(f"session {session_reset.removeprefix('Resets ')}")
+                detail_parts.append(f"session resets {session_reset}")
             if week_reset is not None:
-                detail_parts.append(f"week {week_reset.removeprefix('Resets ')}")
+                detail_parts.append(f"week resets {week_reset}")
             if extra_usage is not None:
-                if extra_usage == "Extra usage not enabled • /extra-usage to enable":
-                    detail_parts.append("extra usage off")
-                else:
-                    detail_parts.append(f"extra usage: {extra_usage}")
+                detail_parts.append(extra_usage)
 
             return ProviderStatus(
                 key="claude",
@@ -230,7 +221,7 @@ def claude_status() -> ProviderStatus:
                     f"week {week_remaining:.0f}% left"
                 ),
                 detail="\n".join(detail_parts),
-                source="claude-status-usage",
+                source="claude-oauth-usage",
                 compact=f"Cl {session_remaining:.0f}/{week_remaining:.0f}",
                 warning=warning,
                 version=version_text,

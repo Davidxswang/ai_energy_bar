@@ -16,8 +16,9 @@ from extension._probe.models import JSONValue
 
 PROVIDER_ORDER: Final[tuple[str, ...]] = ("claude", "codex", "gemini")
 POLL_INTERVAL_SECONDS: Final[int] = 900
-# Wall-clock cap for one probe subprocess. The Claude probe alone drives the
-# `claude` CLI with up to a 60s timeout; budget for all three plus startup.
+# Wall-clock cap for one probe subprocess. Claude (~1s OAuth usage call) and
+# Codex (~1s RPC) are fast; the Gemini CLI probe can burn tens of seconds, so
+# keep generous headroom for all three plus interpreter startup.
 PROBE_TIMEOUT_SECONDS: Final[int] = 180
 
 # Sources that mean "this poll could not read live quota". Mirrors

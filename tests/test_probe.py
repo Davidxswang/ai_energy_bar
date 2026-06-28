@@ -1,5 +1,5 @@
 from extension._probe import shell
-from extension._probe.claude import parse_claude_usage_screen
+from extension._probe.claude import parse_claude_usage
 from extension._probe.codex import normalize_codex_rate_limits
 from extension._probe.gemini import gemini_compact_label
 from extension._probe.gemini_parse import (
@@ -75,111 +75,85 @@ def test_gemini_compact_label_uses_lowest_two_remaining_values() -> None:
     assert gemini_compact_label(metrics) == "Ge 89/92"
 
 
-def test_parse_claude_usage_screen_keeps_session_and_week_resets_separate() -> None:
-    screen_text = """
-    Current session
-    ██▌                                               5% used
-    Resets in
-    3h 25m (America/Los_Angeles)
-    Current week (all models)
-    ██                                                4% used
-    Resets
-    Mar 24, 11pm (America/Los_Angeles)
-    Extra usage
-    Extra usage not enabled • /extra-usage to enable
-    """
+def _usage_payload() -> dict[str, JSONValue]:
+    """A representative ``GET /api/oauth/usage`` response (utilization = % used)."""
+    return {
+        "five_hour": {
+            "utilization": 3.0,
+            "resets_at": "2026-06-28T23:09:59.646359+00:00",
+        },
+        "seven_day": {
+            "utilization": 12.0,
+            "resets_at": "2026-07-03T20:59:59.646384+00:00",
+        },
+        "seven_day_oauth_apps": None,
+        "seven_day_opus": None,
+        "seven_day_sonnet": {
+            "utilization": 9.0,
+            "resets_at": "2026-07-03T20:59:59.646396+00:00",
+        },
+        "extra_usage": {
+            "is_enabled": True,
+            "monthly_limit": 20000,
+            "used_credits": 0.0,
+            "currency": "USD",
+        },
+        "spend": {
+            "used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+            "limit": {"amount_minor": 20000, "currency": "USD", "exponent": 2},
+            "percent": 0,
+        },
+    }
 
-    metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
-        screen_text
+
+def test_parse_claude_usage_maps_session_week_and_sonnet() -> None:
+    metrics, session_reset, week_reset, extra_usage = parse_claude_usage(
+        _usage_payload()
     )
 
-    assert metrics["current_session"].percent_remaining == 95.0
-    assert metrics["current_week"].percent_remaining == 96.0
-    assert session_reset == "Resets in 3h 25m (America/Los_Angeles)"
-    assert week_reset == "Resets Mar 24, 11pm (America/Los_Angeles)"
-    assert extra_usage == "Extra usage not enabled • /extra-usage to enable"
+    assert metrics["current_session"].percent_remaining == 97.0
+    assert metrics["current_week"].percent_remaining == 88.0
+    assert metrics["current_week_sonnet"].percent_remaining == 91.0
+    # Opus bucket is null in the payload, so it is omitted entirely.
+    assert "current_week_opus" not in metrics
+    # Resets are formatted into non-empty localized strings, distinct per bucket
+    # (a swapped/duplicated bucket mapping would also flip the percents above).
+    assert session_reset is not None and session_reset != ""
+    assert week_reset is not None and week_reset != ""
+    assert session_reset != week_reset
+    assert extra_usage == "extra usage $0.00 / $200.00"
 
 
-def test_parse_claude_usage_screen_handles_mangled_session_reset_line() -> None:
-    screen_text = """
-    Current session
-    ████████████████████████████████████████████████  96%used
-    Reses10pm (America/Los_Angeles)
-    Current week (all models)
-    ██████████                                        20%used
-    Resets Mar 24, 11pm (America/Los_Angeles)
-    Extra usage
-    Extra usage not enabled • /extra-usage to enable
-    Esc to cancel
-    """
-
-    metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
-        screen_text
+def test_parse_claude_usage_handles_missing_and_null_buckets() -> None:
+    metrics, session_reset, week_reset, extra_usage = parse_claude_usage(
+        {"five_hour": None, "seven_day": {}}
     )
 
-    assert metrics["current_session"].percent_remaining == 4.0
-    assert metrics["current_week"].percent_remaining == 80.0
-    assert session_reset == "Resets 10pm (America/Los_Angeles)"
-    assert week_reset == "Resets Mar 24, 11pm (America/Los_Angeles)"
-    assert extra_usage == "Extra usage not enabled • /extra-usage to enable"
-
-
-def test_parse_claude_usage_screen_handles_compact_usage_dialog_text() -> None:
-    screen_text = """
-    Curretsession
-    ██4%used
-    Reses1:20am(America/Los_Angeles)
-
-    Currentweek(allmodels)
-    ██████████████████████44%used
-    ResetsMay1,2pm(America/Los_Angeles)
-
-    Currentweek(Sonnetonly)
-    █████████████26%used
-    ResetsMay1,2pm(America/Los_Angeles)
-
-    Extrausage
-    █▎2%used
-    $4.89/$200.00spent·ResetsMay1(America/Los_Angeles)
-    """
-
-    metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
-        screen_text
-    )
-
-    assert metrics["current_session"].percent_remaining == 96.0
-    assert metrics["current_week"].percent_remaining == 56.0
-    assert session_reset == "Resets 1:20am (America/Los_Angeles)"
-    assert week_reset == "Resets May 1, 2pm (America/Los_Angeles)"
-    assert extra_usage == "$4.89/$200.00 spent · Resets May 1 (America/Los_Angeles)"
-
-
-def test_parse_claude_usage_screen_stops_week_reset_at_contribution_section() -> None:
-    screen_text = """
-    Currentsession
-    ██25%used
-    Resets2:10am(America/Los_Angeles)
-
-    Currentweek(allmodels)
-    █████████████████████████50%used
-    ResetsMay1,2pm(America/Los_Angeles)
-
-    What'scontributingtoyourlimitsusage?
-    Approximate,basedonlocalsessionsonthismachine—doesnotinclude
-    otherdevicesorclaude.ai
-    Scanninglocalsessions…
-    Refreshing…
-    """
-
-    metrics, session_reset, week_reset, extra_usage = parse_claude_usage_screen(
-        screen_text
-    )
-
-    assert metrics["current_session"].percent_remaining == 75.0
-    assert metrics["current_week"].percent_remaining == 50.0
-    assert session_reset == "Resets 2:10am (America/Los_Angeles)"
-    assert week_reset == "Resets May 1, 2pm (America/Los_Angeles)"
+    assert metrics["current_session"].percent_remaining is None
+    assert metrics["current_week"].percent_remaining is None
+    assert "current_week_sonnet" not in metrics
+    assert session_reset is None
+    assert week_reset is None
     assert extra_usage is None
+
+
+def test_parse_claude_usage_reports_extra_usage_disabled() -> None:
+    payload = _usage_payload()
+    payload["extra_usage"] = {"is_enabled": False}
+
+    _metrics, _session_reset, _week_reset, extra_usage = parse_claude_usage(payload)
+
+    assert extra_usage == "Extra usage not enabled"
+
+
+def test_parse_claude_usage_reports_extra_usage_enabled_without_spend() -> None:
+    payload = _usage_payload()
+    payload["extra_usage"] = {"is_enabled": True}
+    payload.pop("spend", None)
+
+    _metrics, _session_reset, _week_reset, extra_usage = parse_claude_usage(payload)
+
+    assert extra_usage == "Extra usage enabled"
 
 
 def test_parse_gemini_startup_quota_extracts_footer_quota() -> None:
