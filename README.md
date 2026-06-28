@@ -11,11 +11,11 @@ differs per platform.
 
 ## Current v1 behavior
 
-- Codex: live quota probe from the latest local session JSONL rate-limit events.
-- Claude Code: live quota probe by launching the official CLI and parsing the `/status` usage view.
+- Codex: live quota probe via the Codex `app-server` rate-limit RPC.
+- Claude Code: live quota probe via Anthropic's official `/api/oauth/usage` endpoint, authed with the OAuth token Claude Code already stores on disk (`~/.claude/.credentials.json`) — the same data the in-CLI `/usage` screen shows.
 - Gemini CLI: live quota probe from the installed official Gemini CLI quota path, matching the data surfaced by `/stats`.
 
-The extension avoids private hosted APIs. Exact remaining quota is currently available for Codex, Claude, and Gemini using local session state or official CLI-backed quota data.
+Each probe uses your own local credentials/state — Codex from local session/RPC state, Claude via the official Anthropic usage endpoint with your on-disk token, Gemini from the official CLI quota path. Any probe that can't read live quota degrades to "unavailable" without blocking the others.
 
 ## Layout
 

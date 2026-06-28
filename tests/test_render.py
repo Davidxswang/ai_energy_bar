@@ -51,7 +51,7 @@ def test_merge_keeps_last_live_reading_on_fallback() -> None:
     assert LIVE_FALLBACK_SOURCES["claude"] == frozenset({"claude-auth-metadata"})
     last = _snapshot(
         claude={
-            "source": "claude-status-usage",
+            "source": "claude-oauth-usage",
             "summary": "session 45% left · week 80% left",
             "compact": "Cl 45/80",
         }
@@ -68,7 +68,7 @@ def test_merge_keeps_last_live_reading_on_fallback() -> None:
 
 def test_merge_keeps_current_when_poll_is_live() -> None:
     last = _snapshot(claude={"source": "claude-auth-metadata", "summary": "old"})
-    current = _snapshot(claude={"source": "claude-status-usage", "summary": "new"})
+    current = _snapshot(claude={"source": "claude-oauth-usage", "summary": "new"})
     merged = merge_with_last(current, last)
     claude = _provider(merged, "claude")
     assert claude["summary"] == "new"
