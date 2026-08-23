@@ -1,6 +1,5 @@
 from extension._probe import shell
 from extension._probe.claude import parse_claude_usage
-from extension._probe.codex import normalize_codex_rate_limits
 from extension._probe.gemini import gemini_compact_label
 from extension._probe.gemini_parse import (
     parse_gemini_quota_metrics,
@@ -175,36 +174,6 @@ def test_parse_gemini_startup_quota_extracts_footer_quota() -> None:
     assert detail_text is not None
     assert "Auto (Gemini 3): 3% used" in detail_text
     assert metrics["current_quota"].percent_remaining == 97.0
-
-
-def test_normalize_codex_rate_limits_remaps_app_server_payload() -> None:
-    payload: dict[str, JSONValue] = {
-        "limitId": "codex",
-        "planType": "plus",
-        "primary": {
-            "usedPercent": 4,
-            "windowDurationMins": 300,
-            "resetsAt": 1779279053,
-        },
-        "secondary": {
-            "usedPercent": 12,
-            "windowDurationMins": 10080,
-            "resetsAt": 1779865853,
-        },
-    }
-
-    normalized = normalize_codex_rate_limits(payload)
-
-    assert normalized == {
-        "primary": {"used_percent": 4.0, "resets_at": 1779279053.0},
-        "secondary": {"used_percent": 12.0, "resets_at": 1779865853.0},
-    }
-
-
-def test_normalize_codex_rate_limits_returns_none_for_missing_payload() -> None:
-    assert normalize_codex_rate_limits(None) is None
-    assert normalize_codex_rate_limits({}) is None
-    assert normalize_codex_rate_limits({"primary": None, "secondary": None}) is None
 
 
 def test_resolve_command_path_falls_back_to_login_shell(monkeypatch) -> None:
